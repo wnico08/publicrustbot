@@ -1,5 +1,5 @@
 #!/bin/bash
 while true; do
-    python3 rust_wipe_bot.py
+    python3 main.py
     sleep 5
 done 
