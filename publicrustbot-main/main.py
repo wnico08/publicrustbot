@@ -1,0 +1,332 @@
+import discord
+from discord.ext import commands, tasks
+from datetime import datetime, timedelta
+import os
+import json
+import requests
+from dotenv import load_dotenv
+from flask import Flask
+import threading
+import asyncio
+import yt_dlp
+from discord import FFmpegPCMAudio
+from discord.ext.commands import has_permissions
+
+# Load environment variables
+load_dotenv()
+
+# Initialize Flask app
+app = Flask(__name__)
+
+# Music player settings
+ytdl_format_options = {
+    'format': 'bestaudio/best',
+    'restrictfilenames': True,
+    'noplaylist': True,
+    'nocheckcertificate': True,
+    'ignoreerrors': False,
+    'logtostderr': False,
+    'quiet': True,
+    'no_warnings': True,
+    'default_search': 'auto',
+    'source_address': '0.0.0.0'
+}
+
+ffmpeg_options = {
+    'options': '-vn'
+}
+
+ytdl = yt_dlp.YoutubeDL(ytdl_format_options)
+
+class YTDLSource(discord.PCMVolumeTransformer):
+    def __init__(self, source, *, data, volume=0.5):
+        super().__init__(source, volume)
+        self.data = data
+        self.title = data.get('title')
+        self.url = data.get('url')
+
+    @classmethod
+    async def from_url(cls, url, *, loop=None, stream=False):
+        loop = loop or asyncio.get_event_loop()
+        data = await loop.run_in_executor(None, lambda: ytdl.extract_info(url, download=not stream))
+        
+        if 'entries' in data:
+            data = data['entries'][0]
+            
+        filename = data['url'] if stream else ytdl.prepare_filename(data)
+        return cls(FFmpegPCMAudio(filename, **ffmpeg_options), data=data)
+
+# Store music queues for each guild
+music_queues = {}
+
+@app.route('/health')
+def health_check():
+    return 'OK', 200
+
+def run_flask():
+    app.run(host='0.0.0.0', port=8080)
+
+# Start Flask server in a separate thread
+flask_thread = threading.Thread(target=run_flask)
+flask_thread.daemon = True
+flask_thread.start()
+
+# Bot setup
+intents = discord.Intents.default()
+intents.message_content = True
+bot = commands.Bot(command_prefix='!', intents=intents)
+
+# Store tracked servers
+TRACKED_SERVERS_FILE = 'tracked_servers.json'
+
+def load_tracked_servers():
+    if os.path.exists(TRACKED_SERVERS_FILE):
+        with open(TRACKED_SERVERS_FILE, 'r') as f:
+            return json.load(f)
+    return {}
+
+def save_tracked_servers(servers):
+    with open(TRACKED_SERVERS_FILE, 'w') as f:
+        json.dump(servers, f, indent=4)
+
+# Initialize tracked servers
+tracked_servers = load_tracked_servers()
+
+def get_server_info(server_id):
+    """Get server information from Battlemetrics"""
+    url = f"https://api.battlemetrics.com/servers/{server_id}"
+    headers = {
+        "Authorization": f"Bearer {os.getenv('BATTLEMETRICS_TOKEN')}",
+        "Accept": "application/json"
+    }
+    
+    try:
+        response = requests.get(url, headers=headers)
+        response.raise_for_status()
+        return response.json()
+    except requests.exceptions.RequestException as e:
+        print(f"Error fetching server info: {e}")
+        return None
+
+def get_next_wipe(server_info):
+    """Get next wipe time from server info"""
+    if not server_info or 'data' not in server_info:
+        return None
+    
+    attributes = server_info['data']['attributes']
+    if 'details' in attributes and 'rust_last_wipe' in attributes['details']:
+        last_wipe = datetime.fromisoformat(attributes['details']['rust_last_wipe'].replace('Z', '+00:00'))
+        # Assuming monthly wipes
+        next_wipe = last_wipe + timedelta(days=30)
+        return next_wipe
+    return None
+
+@bot.event
+async def on_ready():
+    print(f'{bot.user} has connected to Discord!')
+    update_status.start()
+
+@tasks.loop(minutes=60)
+async def update_status():
+    if not tracked_servers:
+        await bot.change_presence(activity=None)
+        return
+    
+    # Get the next wipe from any tracked server
+    next_wipe = None
+    next_server_name = None
+    
+    for guild_id, server_id in tracked_servers.items():
+        server_info = get_server_info(server_id)
+        if server_info:
+            wipe_time = get_next_wipe(server_info)
+            if wipe_time and (next_wipe is None or wipe_time < next_wipe):
+                next_wipe = wipe_time
+                next_server_name = server_info['data']['attributes']['name']
+    
+    if next_wipe:
+        time_until = next_wipe - datetime.now(next_wipe.tzinfo)
+        days = time_until.days
+        hours = time_until.seconds // 3600
+        
+        await bot.change_presence(
+            activity=discord.Activity(
+                type=discord.ActivityType.watching,
+                name=f"{next_server_name} wipe in {days}d {hours}h"
+            )
+        )
+    else:
+        await bot.change_presence(activity=None)
+
+@bot.command(name='track')
+async def track_server(ctx, server_id: str):
+    """Track a Rust server using its Battlemetrics ID"""
+    if not os.getenv('BATTLEMETRICS_TOKEN'):
+        await ctx.send("❌ Battlemetrics API token not configured. Please set BATTLEMETRICS_TOKEN in .env file.")
+        return
+    
+    server_info = get_server_info(server_id)
+    if not server_info:
+        await ctx.send("❌ Could not find server with that ID. Please check the Battlemetrics ID and try again.")
+        return
+    
+    server_name = server_info['data']['attributes']['name']
+    tracked_servers[str(ctx.guild.id)] = server_id
+    save_tracked_servers(tracked_servers)
+    
+    embed = discord.Embed(
+        title="Server Tracking Started",
+        description=f"Now tracking wipe times for: {server_name}",
+        color=discord.Color.green()
+    )
+    await ctx.send(embed=embed)
+
+@bot.command(name='untrack')
+async def untrack_server(ctx):
+    """Stop tracking the current server"""
+    if str(ctx.guild.id) in tracked_servers:
+        del tracked_servers[str(ctx.guild.id)]
+        save_tracked_servers(tracked_servers)
+        await ctx.send("✅ Server tracking stopped.")
+    else:
+        await ctx.send("❌ No server is currently being tracked.")
+
+@bot.command(name='wipe')
+async def wipe_time(ctx):
+    """Shows the time until the next wipe for the tracked server"""
+    server_id = tracked_servers.get(str(ctx.guild.id))
+    if not server_id:
+        await ctx.send("❌ No server is currently being tracked. Use `!track <server_id>` to start tracking a server.")
+        return
+    
+    server_info = get_server_info(server_id)
+    if not server_info:
+        await ctx.send("❌ Could not fetch server information. Please try again later.")
+        return
+    
+    server_name = server_info['data']['attributes']['name']
+    next_wipe = get_next_wipe(server_info)
+    
+    if not next_wipe:
+        await ctx.send("❌ Could not determine next wipe time for this server.")
+        return
+    
+    time_until = next_wipe - datetime.now(next_wipe.tzinfo)
+    days = time_until.days
+    hours = time_until.seconds // 3600
+    minutes = (time_until.seconds % 3600) // 60
+    
+    embed = discord.Embed(
+        title=f"Next Wipe for {server_name}",
+        description=f"The next wipe will occur on {next_wipe.strftime('%B %d, %Y')} at {next_wipe.strftime('%H:%M')} UTC",
+        color=discord.Color.orange()
+    )
+    embed.add_field(
+        name="Time Remaining",
+        value=f"{days} days, {hours} hours, and {minutes} minutes",
+        inline=False
+    )
+    
+    await ctx.send(embed=embed)
+
+@bot.command(name='join')
+async def join(ctx):
+    """Join a voice channel"""
+    if not ctx.author.voice:
+        await ctx.send("❌ You need to be in a voice channel first!")
+        return
+    
+    channel = ctx.author.voice.channel
+    if ctx.voice_client is not None:
+        await ctx.voice_client.move_to(channel)
+    else:
+        await channel.connect()
+    
+    await ctx.send(f"✅ Joined {channel.name}")
+
+@bot.command(name='play')
+async def play(ctx, *, url):
+    """Play a song from YouTube"""
+    if not ctx.voice_client:
+        if not ctx.author.voice:
+            await ctx.send("❌ You need to be in a voice channel first!")
+            return
+        await ctx.author.voice.channel.connect()
+    
+    async with ctx.typing():
+        try:
+            player = await YTDLSource.from_url(url, loop=bot.loop, stream=True)
+            
+            if ctx.guild.id not in music_queues:
+                music_queues[ctx.guild.id] = []
+            
+            music_queues[ctx.guild.id].append(player)
+            
+            if not ctx.voice_client.is_playing():
+                await play_next(ctx)
+            
+            await ctx.send(f"✅ Added to queue: {player.title}")
+        except Exception as e:
+            await ctx.send(f"❌ Error: {str(e)}")
+
+async def play_next(ctx):
+    """Play the next song in the queue"""
+    if not music_queues.get(ctx.guild.id):
+        return
+    
+    if len(music_queues[ctx.guild.id]) > 0:
+        player = music_queues[ctx.guild.id].pop(0)
+        ctx.voice_client.play(player, after=lambda e: asyncio.run_coroutine_threadsafe(play_next(ctx), bot.loop))
+        await ctx.send(f"🎵 Now playing: {player.title}")
+
+@bot.command(name='stop')
+async def stop(ctx):
+    """Stop playing and clear the queue"""
+    if not ctx.voice_client:
+        await ctx.send("❌ I'm not playing anything!")
+        return
+    
+    ctx.voice_client.stop()
+    if ctx.guild.id in music_queues:
+        music_queues[ctx.guild.id].clear()
+    await ctx.send("⏹️ Stopped playing and cleared the queue")
+
+@bot.command(name='skip')
+async def skip(ctx):
+    """Skip the current song"""
+    if not ctx.voice_client or not ctx.voice_client.is_playing():
+        await ctx.send("❌ I'm not playing anything!")
+        return
+    
+    ctx.voice_client.stop()
+    await ctx.send("⏭️ Skipped current song")
+
+@bot.command(name='queue')
+async def queue(ctx):
+    """Show the current music queue"""
+    if not music_queues.get(ctx.guild.id) or len(music_queues[ctx.guild.id]) == 0:
+        await ctx.send("📋 Queue is empty")
+        return
+    
+    queue_list = "\n".join([f"{i+1}. {song.title}" for i, song in enumerate(music_queues[ctx.guild.id])])
+    embed = discord.Embed(
+        title="Music Queue",
+        description=queue_list,
+        color=discord.Color.blue()
+    )
+    await ctx.send(embed=embed)
+
+@bot.command(name='leave')
+async def leave(ctx):
+    """Leave the voice channel"""
+    if not ctx.voice_client:
+        await ctx.send("❌ I'm not in a voice channel!")
+        return
+    
+    await ctx.voice_client.disconnect()
+    if ctx.guild.id in music_queues:
+        music_queues[ctx.guild.id].clear()
+    await ctx.send("👋 Left the voice channel")
+
+# Run the bot
+bot.run(os.getenv('DISCORD_TOKEN')) 
